@@ -16,7 +16,7 @@ from scipy.signal import find_peaks
 POSITION_SCALE = 10.0
 DATA_FILE = (
     r"D:\WPS云盘\1634812337\WPS企业云盘\东南大学\我的企业文档\2026\2026.04\TOD_VT"
-    r"\dataset_processed\trajectory_data_lane_id.csv"
+    r"\dataset_processed\trajectory_data_lane_id_basic_columns.csv"
 )
 OUTPUT_FILE = (
     r"D:\WPS云盘\1634812337\WPS企业云盘\东南大学\我的企业文档\2026\2026.04\TOD_VT"
@@ -50,9 +50,13 @@ POST_EVENT_CHECK_SECONDS = 5
 POST_EVENT_CHECK_FRAMES = int(POST_EVENT_CHECK_SECONDS * FPS)
 EVENT_CONTEXT_SECONDS = 5
 EVENT_CONTEXT_FRAMES = int(EVENT_CONTEXT_SECONDS * FPS)
+MIN_POST_STABLE_SECONDS = 1.0
+MIN_POST_STABLE_FRAMES = int(MIN_POST_STABLE_SECONDS * FPS)
 
 SAVE_VISUALIZATIONS = True
 MAX_VISUALIZE_VEHICLES = None
+TIME_CAP = 10.0
+EPSILON = 1e-6
 
 matplotlib.use("Agg")
 
@@ -158,6 +162,62 @@ def find_adjacent_success_pairs(
     return np.array(success_pairs, dtype=int)
 
 
+def get_stable_lane(lane_ids: np.ndarray, center_idx: int, window: int = 3) -> Optional[str]:
+    start_idx = max(0, center_idx - window)
+    end_idx = min(len(lane_ids), center_idx + window + 1)
+    lane_window = lane_ids[start_idx:end_idx]
+    lane_window = lane_window[lane_window != ""]
+    if len(lane_window) == 0:
+        return None
+
+    valid_lanes: List[str] = []
+    for lane in lane_window:
+        try:
+            lane_int = int(float(str(lane)))
+            if 1 <= lane_int <= 3:
+                valid_lanes.append(str(lane_int))
+        except ValueError:
+            continue
+
+    if not valid_lanes:
+        return None
+    return pd.Series(valid_lanes).mode().iloc[0]
+
+
+def extract_valid_mainline_lanes(lane_ids: np.ndarray) -> List[str]:
+    valid_lanes: List[str] = []
+    for lane in lane_ids:
+        try:
+            lane_int = int(float(str(lane)))
+            if 1 <= lane_int <= 3:
+                valid_lanes.append(str(lane_int))
+        except ValueError:
+            continue
+    return valid_lanes
+
+
+def has_min_stable_target_lane(
+    lane_ids: np.ndarray,
+    end_idx: int,
+    target_lane: str,
+    min_stable_frames: int,
+) -> bool:
+    post_lanes = extract_valid_mainline_lanes(lane_ids[end_idx:])
+    if not post_lanes:
+        return False
+
+    consecutive = 0
+    for lane in post_lanes:
+        if lane == target_lane:
+            consecutive += 1
+            if consecutive >= min_stable_frames:
+                return True
+        else:
+            consecutive = 0
+
+    return all(lane == target_lane for lane in post_lanes)
+
+
 def validate_success_pair(
     segment_data: pd.DataFrame,
     start_idx: int,
@@ -173,23 +233,32 @@ def validate_success_pair(
     if max_displacement < min_y_displacement:
         return False
 
-    start_lane = lane_ids[start_idx]
-    end_lane = lane_ids[end_idx]
+    start_lane = get_stable_lane(lane_ids, start_idx)
+    end_lane = get_stable_lane(lane_ids, end_idx)
+    if start_lane is None or end_lane is None:
+        return False
 
-    # Keep the MATLAB logic: a successful lane change must start and end in different lanes.
     if start_lane == end_lane:
         return False
 
-    # Exclude events that enter the ramp because the current study focuses on
-    # interactions during lane changes on the mainline, not topology-driven exits.
-    if end_lane == "ramp":
+    if not is_adjacent_lane_transition(start_lane, end_lane):
         return False
 
-    post_end_idx = min(end_idx + post_event_check_frames, len(lane_ids) - 1)
-    if post_end_idx > end_idx:
-        post_event_lanes = lane_ids[end_idx : post_end_idx + 1]
-        if np.any(post_event_lanes != end_lane):
-            return False
+    valid_event_lanes = extract_valid_mainline_lanes(lane_ids[start_idx : end_idx + 1])
+    if len(set(valid_event_lanes)) < 2:
+        return False
+
+    if start_lane not in valid_event_lanes or end_lane not in valid_event_lanes:
+        return False
+
+    post_end_idx = min(end_idx + post_event_check_frames, len(lane_ids))
+    if not has_min_stable_target_lane(
+        lane_ids[:post_end_idx],
+        end_idx,
+        end_lane,
+        MIN_POST_STABLE_FRAMES,
+    ):
+        return False
 
     return True
 
@@ -211,6 +280,189 @@ def is_adjacent_lane_transition(from_lane: str, to_lane: str) -> bool:
         return abs(int(from_lane) - int(to_lane)) == 1
     except ValueError:
         return False
+
+
+def direction_sign(speed_x: float) -> int:
+    return 1 if float(speed_x) >= 0 else -1
+
+
+def capped(value: float) -> float:
+    return float(np.clip(value, 0.0, TIME_CAP))
+
+
+def compute_accel(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(["Vehicle_ID", "Frame_ID"]).copy()
+    df["Accel_X"] = df.groupby("Vehicle_ID")["Speed_X"].diff().fillna(0.0) * FPS
+    return df
+
+
+def find_lane_neighbors(frame_df: pd.DataFrame, ego_row: pd.Series, lane_id: str):
+    same_lane = frame_df[
+        (frame_df["Lane_ID"].astype(str) == str(lane_id))
+        & (frame_df["Vehicle_ID"] != ego_row["Vehicle_ID"])
+    ].copy()
+    if same_lane.empty:
+        return None, None
+
+    sign = direction_sign(ego_row["Speed_X"])
+    ego_x = float(ego_row["Local_X"])
+    same_lane["_proj"] = sign * same_lane["Local_X"].astype(float)
+    ego_proj = sign * ego_x
+    same_lane = same_lane.sort_values("_proj")
+    proj = same_lane["_proj"].to_numpy(dtype=float)
+    pos = int(np.searchsorted(proj, ego_proj, side="right"))
+
+    leader = same_lane.iloc[pos] if pos < len(same_lane) else None
+    follower = same_lane.iloc[pos - 1] if pos - 1 >= 0 else None
+    return leader, follower
+
+
+def put_neighbor_values(out: dict, prefix: str, row: Optional[pd.Series]) -> None:
+    if row is None:
+        out[f"{prefix}_ID"] = np.nan
+        out[f"{prefix}_Local_X"] = np.nan
+        out[f"{prefix}_Local_Y"] = np.nan
+        out[f"{prefix}_Speed_X"] = np.nan
+        out[f"{prefix}_Speed_Y"] = np.nan
+        out[f"{prefix}_V_Length"] = np.nan
+        out[f"{prefix}_V_Width"] = np.nan
+        out[f"{prefix}_Accel_X"] = np.nan
+        return
+
+    out[f"{prefix}_ID"] = row["Vehicle_ID"]
+    out[f"{prefix}_Local_X"] = float(row["Local_X"])
+    out[f"{prefix}_Local_Y"] = float(row["Local_Y"])
+    out[f"{prefix}_Speed_X"] = float(row["Speed_X"])
+    out[f"{prefix}_Speed_Y"] = float(row["Speed_Y"])
+    out[f"{prefix}_V_Length"] = float(row["V_Length"])
+    out[f"{prefix}_V_Width"] = float(row["V_Width"])
+    out[f"{prefix}_Accel_X"] = float(row.get("Accel_X", 0.0))
+
+
+def compute_ttc(ego: pd.Series, follower_prefix: str, row: dict) -> float:
+    if pd.isna(row[f"{follower_prefix}_ID"]):
+        return TIME_CAP
+    sign = direction_sign(ego["Speed_X"])
+    gap = sign * (float(ego["Local_X"]) - float(row[f"{follower_prefix}_Local_X"]))
+    gap -= (float(ego["V_Length"]) + float(row[f"{follower_prefix}_V_Length"])) / 2.0
+    if gap <= 0:
+        return 0.0
+    closing_speed = sign * (float(row[f"{follower_prefix}_Speed_X"]) - float(ego["Speed_X"]))
+    if closing_speed <= EPSILON:
+        return TIME_CAP
+    return capped(gap / closing_speed)
+
+
+def compute_mttc(ego: pd.Series, follower_prefix: str, row: dict) -> float:
+    if pd.isna(row[f"{follower_prefix}_ID"]):
+        return TIME_CAP
+    sign = direction_sign(ego["Speed_X"])
+    gap = sign * (float(ego["Local_X"]) - float(row[f"{follower_prefix}_Local_X"]))
+    gap -= (float(ego["V_Length"]) + float(row[f"{follower_prefix}_V_Length"])) / 2.0
+    if gap <= 0:
+        return 0.0
+
+    rel_speed = sign * (float(row[f"{follower_prefix}_Speed_X"]) - float(ego["Speed_X"]))
+    rel_acc = sign * (float(row[f"{follower_prefix}_Accel_X"]) - float(ego.get("Accel_X", 0.0)))
+    if abs(rel_acc) <= EPSILON:
+        if rel_speed <= EPSILON:
+            return TIME_CAP
+        return capped(gap / rel_speed)
+
+    disc = rel_speed ** 2 + 2.0 * rel_acc * gap
+    if disc < 0:
+        return TIME_CAP
+    sqrt_disc = np.sqrt(disc)
+    roots = []
+    for sign_choice in (-1.0, 1.0):
+        root = (-rel_speed + sign_choice * sqrt_disc) / rel_acc
+        if root > 0:
+            roots.append(root)
+    if not roots:
+        return TIME_CAP
+    return capped(min(roots))
+
+
+def compute_fl_ttc(ego: pd.Series, follower_prefix: str, row: dict, ttc: float) -> float:
+    if pd.isna(row[f"{follower_prefix}_ID"]):
+        return TIME_CAP
+    lateral_gap = abs(float(ego["Local_Y"]) - float(row[f"{follower_prefix}_Local_Y"]))
+    overlap_span = max((float(ego["V_Width"]) + float(row[f"{follower_prefix}_V_Width"])) / 2.0, EPSILON)
+    overlap_rate = max(0.0, 1.0 - lateral_gap / overlap_span)
+    if overlap_rate <= EPSILON:
+        return TIME_CAP
+    return capped(ttc / overlap_rate)
+
+
+def compute_pet(ego: pd.Series, follower_prefix: str, row: dict, conflict_x: float) -> float:
+    if pd.isna(row[f"{follower_prefix}_ID"]):
+        return TIME_CAP
+    sign = direction_sign(ego["Speed_X"])
+    ego_speed = max(abs(float(ego["Speed_X"])), EPSILON)
+    fol_speed = max(abs(float(row[f"{follower_prefix}_Speed_X"])), EPSILON)
+    ego_dist = sign * (conflict_x - float(ego["Local_X"]))
+    fol_dist = sign * (conflict_x - float(row[f"{follower_prefix}_Local_X"]))
+    if ego_dist < 0 and fol_dist < 0:
+        return 0.0
+    if ego_dist < 0 or fol_dist < 0:
+        return TIME_CAP
+    return capped(abs(ego_dist / ego_speed - fol_dist / fol_speed))
+
+
+def build_output_row(ego: pd.Series, frame_df: pd.DataFrame, lane_change_frame: int, from_lane: str, to_lane: str) -> dict:
+    scenario = 1 if int(float(to_lane)) > int(float(from_lane)) else 2
+    sl_lead, sl_follow = find_lane_neighbors(frame_df, ego, from_lane)
+    tl_lead, tl_follow = find_lane_neighbors(frame_df, ego, to_lane)
+
+    row = {
+        "Vehicle_ID": ego["Vehicle_ID"],
+        "Frame_ID": ego["Frame_ID"],
+        "Local_X": float(ego["Local_X"]),
+        "Local_Y": float(ego["Local_Y"]),
+        "Speed_X": float(ego["Speed_X"]),
+        "Speed_Y": float(ego["Speed_Y"]),
+        "V_Length": float(ego["V_Length"]),
+        "V_Width": float(ego["V_Width"]),
+        "V_Heading": float(ego["V_Heading"]),
+        "Lane_ID": ego["Lane_ID"],
+        "Scenario": scenario,
+        "Lane_Change_Frame": int(lane_change_frame),
+        "Source_La": from_lane,
+        "Target_La": to_lane,
+        "Changing_Time_Offs": round((float(ego["Frame_ID"]) - lane_change_frame) / FPS, 1),
+    }
+    put_neighbor_values(row, "SL_Leading", sl_lead)
+    put_neighbor_values(row, "SL_Following", sl_follow)
+    put_neighbor_values(row, "TL_Leading", tl_lead)
+    put_neighbor_values(row, "TL_Following", tl_follow)
+
+    ttc = compute_ttc(ego, "TL_Following", row)
+    row["PET"] = compute_pet(ego, "TL_Following", row, conflict_x=float(ego["Local_X"]) if float(ego["Frame_ID"]) == lane_change_frame else np.nan)
+    row["TTC"] = ttc
+    row["MTTC"] = compute_mttc(ego, "TL_Following", row)
+    row["FL_TTC"] = compute_fl_ttc(ego, "TL_Following", row, ttc)
+    return row
+
+
+def find_lane_change_frame(
+    frames: np.ndarray,
+    lane_ids: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    from_lane: str,
+    to_lane: str,
+) -> int:
+    for idx in range(start_idx, end_idx + 1):
+        lane = str(lane_ids[idx])
+        if lane == to_lane:
+            return int(frames[idx])
+
+    for idx in range(start_idx, end_idx + 1):
+        lane = str(lane_ids[idx])
+        if lane != from_lane:
+            return int(frames[idx])
+
+    return int(frames[end_idx])
 
 
 def split_event_by_lane_transitions(
@@ -249,11 +501,20 @@ def split_event_by_lane_transitions(
         max_disp = segment_y.max() - segment_y.min()
         if max_disp < min_y_displacement:
             continue
+        lane_change_frame = find_lane_change_frame(
+            frames,
+            lane_ids,
+            sub_start,
+            sub_end,
+            from_lane,
+            to_lane,
+        )
 
         split_events.append(
             [
                 frames[sub_start],
                 frames[sub_end],
+                lane_change_frame,
                 max_disp,
                 sub_end - sub_start + 1,
                 from_lane,
@@ -267,7 +528,7 @@ def split_event_by_lane_transitions(
 
 def remove_overlapping_events(events: np.ndarray) -> np.ndarray:
     if len(events) == 0:
-        return np.empty((0, 7), dtype=object)
+        return np.empty((0, 8), dtype=object)
 
     events = events[np.argsort(events[:, 0])]
     non_overlapping = [events[0]]
@@ -298,13 +559,13 @@ def detect_lane_change_success_wavelet_energy(
     post_event_check_frames: int,
 ) -> np.ndarray:
     if len(segment_data) < 20:
-        return np.empty((0, 7), dtype=object)
+        return np.empty((0, 8), dtype=object)
 
     y_coords = segment_data["Local_Y"].to_numpy(dtype=float)
     frames = segment_data["Frame_ID"].to_numpy()
 
     if np.std(y_coords) < 0.1:
-        return np.empty((0, 7), dtype=object)
+        return np.empty((0, 8), dtype=object)
 
     try:
         coeffs, _ = pywt.cwt(y_coords, wavelet_scales, wavelet_name, sampling_period=SAMPLING_PERIOD)
@@ -317,11 +578,11 @@ def detect_lane_change_success_wavelet_energy(
             energy_threshold_factor,
         )
         if len(singularity_points) < 2:
-            return np.empty((0, 7), dtype=object)
+            return np.empty((0, 8), dtype=object)
 
         filtered_points = filter_singularity_points(singularity_points, singularity_filter_frames)
         if len(filtered_points) < 2:
-            return np.empty((0, 7), dtype=object)
+            return np.empty((0, 8), dtype=object)
 
         candidate_pairs = find_adjacent_success_pairs(
             y_coords,
@@ -330,7 +591,7 @@ def detect_lane_change_success_wavelet_energy(
             max_frames_duration,
         )
         if len(candidate_pairs) == 0:
-            return np.empty((0, 7), dtype=object)
+            return np.empty((0, 8), dtype=object)
 
         valid_events = []
         for start_idx, end_idx in candidate_pairs:
@@ -343,6 +604,9 @@ def detect_lane_change_success_wavelet_energy(
             ):
                 start_frame = frames[start_idx]
                 end_frame = frames[end_idx]
+                lane_ids = segment_data["Lane_ID"].astype(str).to_numpy()
+                start_lane = get_stable_lane(lane_ids, int(start_idx))
+                end_lane = get_stable_lane(lane_ids, int(end_idx))
                 duration_frames = end_idx - start_idx + 1
                 segment_y = y_coords[start_idx : end_idx + 1]
                 max_disp = segment_y.max() - segment_y.min()
@@ -355,21 +619,37 @@ def detect_lane_change_success_wavelet_energy(
                 if split_events:
                     valid_events.extend(split_events)
                 else:
-                    lane_ids = segment_data["Lane_ID"].astype(str).to_numpy()
-                    start_lane = lane_ids[start_idx]
-                    end_lane = lane_ids[end_idx]
+                    if start_lane is None or end_lane is None:
+                        continue
                     if not is_adjacent_lane_transition(start_lane, end_lane):
                         continue
+                    lane_change_frame = find_lane_change_frame(
+                        frames,
+                        lane_ids,
+                        int(start_idx),
+                        int(end_idx),
+                        start_lane,
+                        end_lane,
+                    )
                     valid_events.append(
-                        [start_frame, end_frame, max_disp, duration_frames, start_lane, end_lane, f"{start_lane}->{end_lane}"]
+                        [
+                            start_frame,
+                            end_frame,
+                            lane_change_frame,
+                            max_disp,
+                            duration_frames,
+                            start_lane,
+                            end_lane,
+                            f"{start_lane}->{end_lane}",
+                        ]
                     )
 
         if not valid_events:
-            return np.empty((0, 7), dtype=object)
+            return np.empty((0, 8), dtype=object)
 
         return remove_overlapping_events(np.array(valid_events, dtype=object))
     except Exception:
-        return np.empty((0, 7), dtype=object)
+        return np.empty((0, 8), dtype=object)
 
 
 def visualize_wavelet_energy_results(
@@ -557,6 +837,8 @@ def main() -> None:
     data["Frame_ID"] = data[frame_col]
 
     data = data.dropna(subset=["Local_Y", "Vehicle_ID", "Frame_ID", "Lane_ID"]).copy()
+    data = compute_accel(data)
+    frame_lookup = {int(frame): group.copy() for frame, group in data.groupby("Frame_ID", sort=False)}
     unique_vehicles = pd.unique(data["Vehicle_ID"])
 
     print(f"数据加载完成，共 {len(unique_vehicles)} 个车辆，{len(data)} 行数据")
@@ -587,29 +869,60 @@ def main() -> None:
             for event_idx, event in enumerate(lanechange_events, start=1):
                 start_frame = event[0]
                 end_frame = event[1]
-                max_disp = event[2]
-                duration_frames = event[3]
-                from_lane = event[4]
-                to_lane = event[5]
-                lane_path = event[6]
-                results.append([vehicle_id, start_frame, end_frame, max_disp, duration_frames, from_lane, to_lane, lane_path])
+                lane_change_frame = event[2]
+                max_disp = event[3]
+                duration_frames = event[4]
+                from_lane = event[5]
+                to_lane = event[6]
+                lane_path = event[7]
+                results.append(
+                    [vehicle_id, start_frame, end_frame, lane_change_frame, max_disp, duration_frames, from_lane, to_lane, lane_path]
+                )
 
-                window_start_frame = max(vehicle_data["Frame_ID"].min(), start_frame - EVENT_CONTEXT_FRAMES)
-                window_end_frame = min(vehicle_data["Frame_ID"].max(), end_frame + EVENT_CONTEXT_FRAMES)
+                window_start_frame = max(vehicle_data["Frame_ID"].min(), lane_change_frame - EVENT_CONTEXT_FRAMES)
+                window_end_frame = min(vehicle_data["Frame_ID"].max(), lane_change_frame + EVENT_CONTEXT_FRAMES)
 
                 event_segment = vehicle_data[
                     (vehicle_data["Frame_ID"] >= window_start_frame) & (vehicle_data["Frame_ID"] <= window_end_frame)
                 ].copy()
-                event_segment.insert(0, "Event_Index", event_idx)
-                event_segment.insert(0, "Vehicle_ID_Event", vehicle_id)
-                event_segment.insert(2, "Start_Frame", start_frame)
-                event_segment.insert(3, "End_Frame", end_frame)
-                event_segment.insert(4, "From_Lane", from_lane)
-                event_segment.insert(5, "To_Lane", to_lane)
-                event_segment.insert(6, "Lane_Path", lane_path)
-                event_segment.insert(7, "Window_Start_Frame", window_start_frame)
-                event_segment.insert(8, "Window_End_Frame", window_end_frame)
-                event_rows.append(event_segment)
+                conflict_row = vehicle_data[vehicle_data["Frame_ID"] == lane_change_frame]
+                if conflict_row.empty:
+                    conflict_x = float(event_segment.iloc[0]["Local_X"])
+                else:
+                    conflict_x = float(conflict_row.iloc[0]["Local_X"])
+
+                for _, ego in event_segment.iterrows():
+                    frame_id = int(ego["Frame_ID"])
+                    frame_df = frame_lookup.get(frame_id)
+                    if frame_df is None:
+                        continue
+
+                    ego_match = frame_df[
+                        (frame_df["Vehicle_ID"] == ego["Vehicle_ID"])
+                        & (frame_df["Frame_ID"] == ego["Frame_ID"])
+                    ]
+                    if ego_match.empty:
+                        continue
+
+                    ego_full = ego_match.iloc[0].copy()
+                    row = build_output_row(
+                        ego_full,
+                        frame_df,
+                        int(lane_change_frame),
+                        str(from_lane),
+                        str(to_lane),
+                    )
+                    row["PET"] = compute_pet(ego_full, "TL_Following", row, conflict_x)
+                    row["Vehicle_ID_Event"] = vehicle_id
+                    row["Event_Index"] = event_idx
+                    row["Start_Frame"] = start_frame
+                    row["End_Frame"] = end_frame
+                    row["From_Lane"] = from_lane
+                    row["To_Lane"] = to_lane
+                    row["Lane_Path"] = lane_path
+                    row["Window_Start_Frame"] = window_start_frame
+                    row["Window_End_Frame"] = window_end_frame
+                    event_rows.append(row)
 
             should_visualize = SAVE_VISUALIZATIONS and (
                 MAX_VISUALIZE_VEHICLES is None or visualized < MAX_VISUALIZE_VEHICLES
@@ -639,6 +952,7 @@ def main() -> None:
                 "Vehicle_ID",
                 "Start_Frame",
                 "End_Frame",
+                "Lane_Change_Frame",
                 "Max_Displacement",
                 "Duration_Frames",
                 "From_Lane",
@@ -651,7 +965,47 @@ def main() -> None:
         print(f"\n结果已输出到：{OUTPUT_FILE}")
 
         if event_rows:
-            event_rows_table = pd.concat(event_rows, ignore_index=True)
+            event_rows_table = pd.DataFrame(event_rows)
+            ordered_cols = [
+                "Vehicle_ID",
+                "Frame_ID",
+                "Local_X",
+                "Local_Y",
+                "Speed_X",
+                "Speed_Y",
+                "V_Length",
+                "V_Width",
+                "V_Heading",
+                "Lane_ID",
+                "Scenario",
+                "Lane_Change_Frame",
+                "Source_La",
+                "Target_La",
+                "Changing_Time_Offs",
+            ]
+            for prefix in ["SL_Leading", "SL_Following", "TL_Leading", "TL_Following"]:
+                ordered_cols.extend(
+                    [
+                        f"{prefix}_ID",
+                        f"{prefix}_Local_X",
+                        f"{prefix}_Local_Y",
+                        f"{prefix}_Speed_X",
+                        f"{prefix}_Speed_Y",
+                    ]
+                )
+            ordered_cols.extend(["PET", "TTC", "MTTC", "FL_TTC"])
+            keep_cols = ordered_cols + [
+                "Vehicle_ID_Event",
+                "Event_Index",
+                "Start_Frame",
+                "End_Frame",
+                "From_Lane",
+                "To_Lane",
+                "Lane_Path",
+                "Window_Start_Frame",
+                "Window_End_Frame",
+            ]
+            event_rows_table = event_rows_table[keep_cols]
             event_rows_table.to_csv(OUTPUT_EVENT_ROWS_FILE, index=False, encoding="utf-8-sig")
             print(f"换道事件轨迹明细已输出到：{OUTPUT_EVENT_ROWS_FILE}")
 
